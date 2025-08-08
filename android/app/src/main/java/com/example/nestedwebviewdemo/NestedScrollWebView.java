@@ -23,6 +23,9 @@ public class NestedScrollWebView extends WebView implements NestedScrollingChild
     private final int[] scrollOffset = new int[2];
 
     private VelocityTracker velocityTracker;
+    private int activePointerId = MotionEvent.INVALID_POINTER_ID;
+    private final int maximumFlingVelocity;
+
     private volatile boolean allowScroll = false;
 
     public NestedScrollWebView(@NonNull Context context) {
@@ -38,16 +41,21 @@ public class NestedScrollWebView extends WebView implements NestedScrollingChild
         nestedScrollingChildHelper = new NestedScrollingChildHelper(this);
         setNestedScrollingEnabled(true);
         setOverScrollMode(OVER_SCROLL_NEVER);
+        ViewConfiguration vc = ViewConfiguration.get(context);
+        maximumFlingVelocity = vc.getScaledMaximumFlingVelocity();
     }
 
     public void setAllowScroll(boolean allow) {
         this.allowScroll = allow;
+        if (!allow) {
+            // 确保内容不会意外保留滚动位置
+            scrollTo(getScrollX(), 0);
+        }
     }
 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
-        boolean handled = true;
-        MotionEvent trackedEvent = MotionEvent.obtain(event);
+        MotionEvent tracked = MotionEvent.obtain(event);
         final int action = event.getActionMasked();
 
         if (velocityTracker == null) {
@@ -57,46 +65,73 @@ public class NestedScrollWebView extends WebView implements NestedScrollingChild
 
         if (action == MotionEvent.ACTION_DOWN) {
             nestedOffsetY = 0;
+            activePointerId = event.getPointerId(0);
             lastTouchY = (int) event.getY();
             startNestedScroll(ViewCompat.SCROLL_AXIS_VERTICAL, ViewCompat.TYPE_TOUCH);
-            // 让 WebView 接管手势（以便中途在吸顶瞬间无缝切换到自身滚动）
-            handled = super.onTouchEvent(trackedEvent);
-        } else if (action == MotionEvent.ACTION_MOVE) {
-            int y = (int) event.getY();
-            int dy = lastTouchY - y; // up is positive
+            // 仅建立手势，不在未允许时产生滚动
+            super.onTouchEvent(tracked);
+            tracked.recycle();
+            return true;
+        }
+
+        if (action == MotionEvent.ACTION_MOVE) {
+            int index = event.findPointerIndex(activePointerId);
+            if (index < 0) index = 0;
+            int y = (int) event.getY(index);
+            int dy = lastTouchY - y; // up positive
 
             // 父容器预消费（用于折叠/展开 AppBar）
             if (dispatchNestedPreScroll(0, dy, scrollConsumed, scrollOffset, ViewCompat.TYPE_TOUCH)) {
                 dy -= scrollConsumed[1];
-                trackedEvent.offsetLocation(0, scrollOffset[1]);
+                tracked.offsetLocation(0, scrollOffset[1]);
                 nestedOffsetY += scrollOffset[1];
             }
 
             int scrolledByY = 0;
             if (allowScroll) {
-                int oldY = getScrollY();
-                super.onTouchEvent(trackedEvent);
-                scrolledByY = getScrollY() - oldY;
+                int before = getScrollY();
+                super.onTouchEvent(tracked);
+                scrolledByY = getScrollY() - before;
             }
 
             int unconsumedY = dy - scrolledByY;
-            // 将未消费部分交还父容器
             dispatchNestedScroll(0, scrolledByY, 0, unconsumedY, scrollOffset, ViewCompat.TYPE_TOUCH);
 
             lastTouchY = y - scrollOffset[1];
-        } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
-            super.onTouchEvent(trackedEvent);
+            tracked.recycle();
+            return true;
+        }
+
+        if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            // 处理 fling：未允许滚动时，优先交给父容器
+            velocityTracker.computeCurrentVelocity(1000, maximumFlingVelocity);
+            float vY = velocityTracker.getYVelocity(activePointerId);
+            float velocityY = -vY; // up positive
+
+            if (!allowScroll) {
+                boolean parentConsumed = dispatchNestedPreFling(0, velocityY);
+                dispatchNestedFling(0, velocityY, parentConsumed);
+                // 不把 fling 交给 WebView
+            } else {
+                // 允许滚动时，先询问父容器预消费，再交给 WebView 自己处理
+                dispatchNestedPreFling(0, velocityY);
+                super.onTouchEvent(tracked);
+                dispatchNestedFling(0, velocityY, true);
+            }
+
             stopNestedScroll(ViewCompat.TYPE_TOUCH);
+            activePointerId = MotionEvent.INVALID_POINTER_ID;
             if (velocityTracker != null) {
                 velocityTracker.recycle();
                 velocityTracker = null;
             }
-        } else {
-            handled = super.onTouchEvent(trackedEvent);
+            tracked.recycle();
+            return true;
         }
 
-        trackedEvent.recycle();
-        return handled;
+        boolean result = super.onTouchEvent(tracked);
+        tracked.recycle();
+        return result;
     }
 
     // NestedScrollingChild2 implementation
