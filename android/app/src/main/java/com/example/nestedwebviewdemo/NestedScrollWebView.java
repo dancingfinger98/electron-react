@@ -5,6 +5,7 @@ import android.util.AttributeSet;
 import android.view.MotionEvent;
 import android.view.VelocityTracker;
 import android.view.ViewConfiguration;
+import android.view.ViewParent;
 import android.webkit.WebView;
 
 import androidx.annotation.NonNull;
@@ -25,6 +26,8 @@ public class NestedScrollWebView extends WebView implements NestedScrollingChild
     private VelocityTracker velocityTracker;
     private int activePointerId = MotionEvent.INVALID_POINTER_ID;
     private final int maximumFlingVelocity;
+    private final int touchSlop;
+    private boolean isDragging = false;
 
     private volatile boolean allowScroll = false;
 
@@ -43,12 +46,12 @@ public class NestedScrollWebView extends WebView implements NestedScrollingChild
         setOverScrollMode(OVER_SCROLL_NEVER);
         ViewConfiguration vc = ViewConfiguration.get(context);
         maximumFlingVelocity = vc.getScaledMaximumFlingVelocity();
+        touchSlop = vc.getScaledTouchSlop();
     }
 
     public void setAllowScroll(boolean allow) {
         this.allowScroll = allow;
         if (!allow) {
-            // 确保内容不会意外保留滚动位置
             scrollTo(getScrollX(), 0);
         }
     }
@@ -67,8 +70,8 @@ public class NestedScrollWebView extends WebView implements NestedScrollingChild
             nestedOffsetY = 0;
             activePointerId = event.getPointerId(0);
             lastTouchY = (int) event.getY();
+            isDragging = false;
             startNestedScroll(ViewCompat.SCROLL_AXIS_VERTICAL, ViewCompat.TYPE_TOUCH);
-            // 仅建立手势，不在未允许时产生滚动
             super.onTouchEvent(tracked);
             tracked.recycle();
             return true;
@@ -78,13 +81,31 @@ public class NestedScrollWebView extends WebView implements NestedScrollingChild
             int index = event.findPointerIndex(activePointerId);
             if (index < 0) index = 0;
             int y = (int) event.getY(index);
-            int dy = lastTouchY - y; // up positive
+            int dyRaw = lastTouchY - y; // up positive
 
-            // 父容器预消费（用于折叠/展开 AppBar）
+            if (!isDragging && Math.abs(dyRaw) > touchSlop) {
+                isDragging = true;
+            }
+            if (!isDragging) {
+                tracked.recycle();
+                return true;
+            }
+
+            int dy = dyRaw;
+
             if (dispatchNestedPreScroll(0, dy, scrollConsumed, scrollOffset, ViewCompat.TYPE_TOUCH)) {
                 dy -= scrollConsumed[1];
                 tracked.offsetLocation(0, scrollOffset[1]);
                 nestedOffsetY += scrollOffset[1];
+            }
+
+            // 当允许 WebView 滚动时，避免父容器抢夺事件；反之允许父容器拦截
+            ViewParent parent = getParent();
+            if (parent != null) {
+                boolean atTop = !canScrollVertically(-1);
+                boolean scrollingDown = dy < 0; // finger moves down, content tries to scroll down
+                boolean disallow = allowScroll && !(scrollingDown && atTop);
+                parent.requestDisallowInterceptTouchEvent(disallow);
             }
 
             int scrolledByY = 0;
@@ -103,7 +124,6 @@ public class NestedScrollWebView extends WebView implements NestedScrollingChild
         }
 
         if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
-            // 处理 fling：未允许滚动时，优先交给父容器
             velocityTracker.computeCurrentVelocity(1000, maximumFlingVelocity);
             float vY = velocityTracker.getYVelocity(activePointerId);
             float velocityY = -vY; // up positive
@@ -111,9 +131,7 @@ public class NestedScrollWebView extends WebView implements NestedScrollingChild
             if (!allowScroll) {
                 boolean parentConsumed = dispatchNestedPreFling(0, velocityY);
                 dispatchNestedFling(0, velocityY, parentConsumed);
-                // 不把 fling 交给 WebView
             } else {
-                // 允许滚动时，先询问父容器预消费，再交给 WebView 自己处理
                 dispatchNestedPreFling(0, velocityY);
                 super.onTouchEvent(tracked);
                 dispatchNestedFling(0, velocityY, true);
@@ -121,6 +139,7 @@ public class NestedScrollWebView extends WebView implements NestedScrollingChild
 
             stopNestedScroll(ViewCompat.TYPE_TOUCH);
             activePointerId = MotionEvent.INVALID_POINTER_ID;
+            isDragging = false;
             if (velocityTracker != null) {
                 velocityTracker.recycle();
                 velocityTracker = null;
