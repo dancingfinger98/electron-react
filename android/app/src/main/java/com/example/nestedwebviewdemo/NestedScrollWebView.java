@@ -15,7 +15,6 @@ import androidx.core.view.ViewCompat;
 
 public class NestedScrollWebView extends WebView implements NestedScrollingChild2 {
 
-    private final int touchSlop;
     private final NestedScrollingChildHelper nestedScrollingChildHelper;
 
     private int lastTouchY;
@@ -24,6 +23,7 @@ public class NestedScrollWebView extends WebView implements NestedScrollingChild
     private final int[] scrollOffset = new int[2];
 
     private VelocityTracker velocityTracker;
+    private volatile boolean allowScroll = false;
 
     public NestedScrollWebView(@NonNull Context context) {
         this(context, null);
@@ -35,16 +35,18 @@ public class NestedScrollWebView extends WebView implements NestedScrollingChild
 
     public NestedScrollWebView(@NonNull Context context, @Nullable AttributeSet attrs, int defStyleAttr) {
         super(context, attrs, defStyleAttr);
-        ViewConfiguration configuration = ViewConfiguration.get(context);
-        touchSlop = configuration.getScaledTouchSlop();
         nestedScrollingChildHelper = new NestedScrollingChildHelper(this);
         setNestedScrollingEnabled(true);
         setOverScrollMode(OVER_SCROLL_NEVER);
     }
 
+    public void setAllowScroll(boolean allow) {
+        this.allowScroll = allow;
+    }
+
     @Override
     public boolean onTouchEvent(MotionEvent event) {
-        boolean handled;
+        boolean handled = true;
         MotionEvent trackedEvent = MotionEvent.obtain(event);
         final int action = event.getActionMasked();
 
@@ -55,59 +57,42 @@ public class NestedScrollWebView extends WebView implements NestedScrollingChild
 
         if (action == MotionEvent.ACTION_DOWN) {
             nestedOffsetY = 0;
-        }
-        // Offset event by any nested offset so parent consumes first
-        trackedEvent.offsetLocation(0, nestedOffsetY);
+            lastTouchY = (int) event.getY();
+            startNestedScroll(ViewCompat.SCROLL_AXIS_VERTICAL, ViewCompat.TYPE_TOUCH);
+            // 让 WebView 接管手势（以便中途在吸顶瞬间无缝切换到自身滚动）
+            handled = super.onTouchEvent(trackedEvent);
+        } else if (action == MotionEvent.ACTION_MOVE) {
+            int y = (int) event.getY();
+            int dy = lastTouchY - y; // up is positive
 
-        switch (action) {
-            case MotionEvent.ACTION_DOWN: {
-                lastTouchY = (int) event.getY();
-                startNestedScroll(ViewCompat.SCROLL_AXIS_VERTICAL, ViewCompat.TYPE_TOUCH);
-                handled = super.onTouchEvent(trackedEvent);
-                break;
+            // 父容器预消费（用于折叠/展开 AppBar）
+            if (dispatchNestedPreScroll(0, dy, scrollConsumed, scrollOffset, ViewCompat.TYPE_TOUCH)) {
+                dy -= scrollConsumed[1];
+                trackedEvent.offsetLocation(0, scrollOffset[1]);
+                nestedOffsetY += scrollOffset[1];
             }
-            case MotionEvent.ACTION_MOVE: {
-                int y = (int) event.getY();
-                int dy = lastTouchY - y; // up is positive
 
-                // 让父容器优先预消费（例如 AppBar 折叠）
-                if (dispatchNestedPreScroll(0, dy, scrollConsumed, scrollOffset, ViewCompat.TYPE_TOUCH)) {
-                    dy -= scrollConsumed[1];
-                    trackedEvent.offsetLocation(0, scrollOffset[1]);
-                    nestedOffsetY += scrollOffset[1];
-                }
-
+            int scrolledByY = 0;
+            if (allowScroll) {
                 int oldY = getScrollY();
-                handled = super.onTouchEvent(trackedEvent);
-                int scrolledByY = getScrollY() - oldY;
+                super.onTouchEvent(trackedEvent);
+                scrolledByY = getScrollY() - oldY;
+            }
 
-                int unconsumedY = dy - scrolledByY;
-                // 将未消费部分继续交给父容器（例如当 WebView 在顶部或底部时）
-                dispatchNestedScroll(0, scrolledByY, 0, unconsumedY, scrollOffset, ViewCompat.TYPE_TOUCH);
+            int unconsumedY = dy - scrolledByY;
+            // 将未消费部分交还父容器
+            dispatchNestedScroll(0, scrolledByY, 0, unconsumedY, scrollOffset, ViewCompat.TYPE_TOUCH);
 
-                lastTouchY = y - scrollOffset[1];
-                break;
+            lastTouchY = y - scrollOffset[1];
+        } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            super.onTouchEvent(trackedEvent);
+            stopNestedScroll(ViewCompat.TYPE_TOUCH);
+            if (velocityTracker != null) {
+                velocityTracker.recycle();
+                velocityTracker = null;
             }
-            case MotionEvent.ACTION_UP: {
-                handled = super.onTouchEvent(trackedEvent);
-                stopNestedScroll(ViewCompat.TYPE_TOUCH);
-                if (velocityTracker != null) {
-                    velocityTracker.recycle();
-                    velocityTracker = null;
-                }
-                break;
-            }
-            case MotionEvent.ACTION_CANCEL: {
-                handled = super.onTouchEvent(trackedEvent);
-                stopNestedScroll(ViewCompat.TYPE_TOUCH);
-                if (velocityTracker != null) {
-                    velocityTracker.recycle();
-                    velocityTracker = null;
-                }
-                break;
-            }
-            default:
-                handled = super.onTouchEvent(trackedEvent);
+        } else {
+            handled = super.onTouchEvent(trackedEvent);
         }
 
         trackedEvent.recycle();
